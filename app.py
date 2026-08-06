@@ -10,31 +10,49 @@ from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parent
 PORT = int(os.environ.get("P4_DASHBOARD_PORT", "8765"))
-BUILD = "0.6.1"
+BUILD = "0.7.0"
 PID_FILE = ROOT / ".p4-monitor.pid"
 SETTINGS_FILE = ROOT / ".p4-monitor.json"
 SETTING_KEYS = ("P4PORT", "P4USER", "P4CLIENT")
 
 def load_settings():
     try:
-        return {k: str(v).strip() for k, v in json.loads(SETTINGS_FILE.read_text()).items() if k in SETTING_KEYS and str(v).strip()}
+        raw = json.loads(SETTINGS_FILE.read_text())
+        result = {k: str(raw.get(k, "")).strip() for k in SETTING_KEYS if str(raw.get(k, "")).strip()}
+        result["clients"] = [str(value).strip() for value in raw.get("clients", []) if str(value).strip()]
+        if result.get("P4CLIENT") and result["P4CLIENT"] not in result["clients"]:
+            result["clients"].insert(0, result["P4CLIENT"])
+        return result
     except (OSError, json.JSONDecodeError):
         return {}
 
 def save_settings(values):
+    previous = load_settings()
     cleaned = {k: str(values.get(k, "")).strip() for k in SETTING_KEYS if str(values.get(k, "")).strip()}
+    clients = previous.get("clients", [])
+    if cleaned.get("P4CLIENT"):
+        clients = [cleaned["P4CLIENT"], *[value for value in clients if value != cleaned["P4CLIENT"]]]
+    cleaned["clients"] = clients
     SETTINGS_FILE.write_text(json.dumps(cleaned, indent=2) + "\n")
     return cleaned
 
-def p4(*args):
+def remove_client(name):
+    settings = load_settings()
+    settings["clients"] = [value for value in settings.get("clients", []) if value != name]
+    if settings.get("P4CLIENT") == name:
+        settings.pop("P4CLIENT", None)
+    SETTINGS_FILE.write_text(json.dumps(settings, indent=2) + "\n")
+    return settings
+
+def p4(*args, timeout=12):
     if not shutil.which("p4"):
         return 127, "", "The 'p4' command is not installed or not in PATH."
     env = os.environ.copy(); env.update(load_settings())
     try:
-        run = subprocess.run(["p4", *args], capture_output=True, text=True, timeout=12, env=env)
+        run = subprocess.run(["p4", *args], capture_output=True, text=True, timeout=timeout, env=env)
         return run.returncode, run.stdout, run.stderr.strip()
     except subprocess.TimeoutExpired:
-        return 124, "", "Timed out after 12 seconds. Check P4PORT, VPN, and server reachability."
+        return 124, "", f"Timed out after {timeout} seconds. Check P4PORT, VPN, and server reachability."
 
 def fields(spec):
     out = {}
@@ -71,6 +89,7 @@ def ztag_files(text):
         if key == "clientFile":
             if not current.get("path"):
                 current["path"] = value
+            current["clientPath"] = value
             continue
         if key == "action" and current.get("path"):
             current["action"] = value
@@ -84,6 +103,31 @@ def ztag_files(text):
         records.append(current)
     numbered = [{"path": paths[i], "action": actions.get(i, "edit")} for i in sorted(paths, key=int)]
     return records or numbered
+
+def ztag_fstat_files(text):
+    rows, row = [], {}
+    for line in text.splitlines():
+        if not line.startswith("... "): continue
+        key, _, value = line[4:].partition(" ")
+        if key == "depotFile" and row.get("path"):
+            rows.append(row); row = {}
+        if key == "depotFile": row["path"] = value
+        elif key == "clientFile": row["clientPath"] = value
+        elif key == "action": row["action"] = value
+        elif key in ("headType", "type"): row["type"] = value
+        elif key == "headTime": row["modified"] = value
+        elif key == "headRev": row["headRev"] = value
+        elif key == "haveRev": row["haveRev"] = value
+    if row.get("path"): rows.append(row)
+    for item in rows:
+        client_path = item.get("clientPath")
+        if client_path:
+            try:
+                stat = Path(client_path).stat()
+                item["workspaceModified"] = int(stat.st_mtime)
+                item["created"] = int(stat.st_ctime)
+            except OSError: pass
+    return rows
 
 def change_files(change):
     code, output, _ = p4("-ztag", "describe", "-s", change)
@@ -128,10 +172,38 @@ def changes():
     if pending_code: errors.append("Outgoing query: " + (pending_error or "failed"))
     return {"build": BUILD, "workspace": client, "incoming": format_changes(ztag_changes(incoming_text) if not incoming_code else []), "outgoing": format_changes(outgoing, default_files), "errors": errors, "checkedAt": datetime.now(timezone.utc).isoformat()}
 
+def all_files():
+    client, error = workspace()
+    if error: return {"error": error}
+    path = (client.get("stream") or f"//{client['name']}").rstrip("/") + "/..."
+    code, output, command_error = p4("-ztag", "fstat", "-T", "depotFile,clientFile,action,headType,type,headTime,headRev,haveRev", path, timeout=45)
+    if code and not output: return {"error": command_error or "Unable to list files."}
+    files = ztag_fstat_files(output)
+    return {"build": BUILD, "workspace": client, "files": files, "warning": command_error if code else ""}
+
+def action_request(payload):
+    client, error = workspace()
+    if error: return {"error": error}
+    action = str(payload.get("action", ""))
+    change = str(payload.get("change", "")).strip()
+    stream = client.get("stream", "")
+    commands = {
+        "merge-down": ["merge", "-S", stream],
+        "copy-up": ["copy", "-S", stream, "-r"],
+        "submit": ["submit", "-c", change],
+    }
+    command = commands.get(action)
+    if not command or any(value == "" for value in command): return {"error": "This action needs a stream and, for submit, a numbered changelist."}
+    display = "p4 " + " ".join(command)
+    if not payload.get("confirmed"): return {"preview": display, "requiresConfirmation": True}
+    code, output, command_error = p4(*command, timeout=120)
+    return {"command": display, "ok": code == 0, "output": output[-12000:], "error": command_error[-4000:]}
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         route = urlparse(self.path).path
         if route == "/api/changes": return self.json(changes())
+        if route == "/api/files": return self.json(all_files())
         if route == "/api/settings": return self.json(load_settings())
         files = {"/": ("index.html", "text/html; charset=utf-8"), "/index.html": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "application/javascript; charset=utf-8"), "/style.css": ("style.css", "text/css; charset=utf-8")}
         if route in files:
@@ -139,10 +211,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200); self.send_header("Content-Type", content_type); self.end_headers(); self.wfile.write(body); return
         self.send_error(404)
     def do_POST(self):
-        if urlparse(self.path).path != "/api/settings": return self.send_error(404)
+        route = urlparse(self.path).path
         try:
             size = int(self.headers.get("Content-Length", "0")); values = json.loads(self.rfile.read(size))
-            self.json({"settings": save_settings(values)})
+            if route == "/api/settings": return self.json({"settings": save_settings(values)})
+            if route == "/api/settings/remove-client": return self.json({"settings": remove_client(str(values.get("client", "")))})
+            if route == "/api/action": return self.json(action_request(values))
+            self.send_error(404)
         except (ValueError, json.JSONDecodeError): self.json({"error": "Invalid connection settings."}, 400)
     def json(self, value, status=200):
         body = json.dumps(value).encode(); self.send_response(status); self.send_header("Content-Type", "application/json"); self.send_header("Cache-Control", "no-store"); self.end_headers(); self.wfile.write(body)
