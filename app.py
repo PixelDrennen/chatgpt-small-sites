@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit, json, os, re, shutil, subprocess
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -10,7 +11,7 @@ from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parent
 PORT = int(os.environ.get("P4_DASHBOARD_PORT", "8765"))
-BUILD = "0.7.1"
+BUILD = "0.7.2"
 PID_FILE = ROOT / ".p4-monitor.pid"
 SETTINGS_FILE = ROOT / ".p4-monitor.json"
 SETTING_KEYS = ("P4PORT", "P4USER", "P4CLIENT")
@@ -149,12 +150,15 @@ def workspace():
     client = fields(spec)
     return {"name": client.get("Client", configured.get("P4CLIENT", "")), "root": client.get("Root", ""), "stream": client.get("Stream", "")}, None
 
-def format_changes(rows, default_files=None):
-    result = []
-    for row in rows:
+def format_changes(rows, default_files=None, file_limit=None):
+    def format_one(row):
         ident = row.get("change", "?")
-        result.append({"id": ident, "user": row.get("user", ""), "client": row.get("client", ""), "description": row.get("desc", "").strip(), "files": default_files if ident == "default" else change_files(ident)})
-    return result
+        files = default_files if ident == "default" else change_files(ident)
+        return {"id": ident, "user": row.get("user", ""), "client": row.get("client", ""), "description": row.get("desc", "").strip(), "fileCount": len(files), "files": files[:file_limit] if file_limit else files}
+    if len(rows) < 2:
+        return [format_one(row) for row in rows]
+    with ThreadPoolExecutor(max_workers=min(6, len(rows))) as executor:
+        return list(executor.map(format_one, rows))
 
 def changes():
     client, error = workspace()
@@ -165,16 +169,26 @@ def changes():
     # make the server search an unrelated/nonexistent depot tree.
     depot_path = (client.get("stream") or f"//{name}").rstrip("/") + "/..."
     incoming_path = f"{depot_path}@{name},#head"
-    incoming_code, incoming_text, incoming_error = p4("-ztag", "changes", "-s", "submitted", "-l", "-m", "25", incoming_path)
-    pending_code, pending_text, pending_error = p4("-ztag", "changes", "-s", "pending", "-l", "-m", "50", "-c", name)
-    open_code, open_text, _ = p4("-ztag", "opened", "-c", "default")
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        incoming_future = executor.submit(p4, "-ztag", "changes", "-s", "submitted", "-l", "-m", "25", incoming_path)
+        pending_future = executor.submit(p4, "-ztag", "changes", "-s", "pending", "-l", "-m", "50", "-c", name)
+        open_future = executor.submit(p4, "-ztag", "opened", "-c", "default")
+        incoming_code, incoming_text, incoming_error = incoming_future.result()
+        pending_code, pending_text, pending_error = pending_future.result()
+        open_code, open_text, _ = open_future.result()
     default_files = ztag_files(open_text) if not open_code else []
     outgoing = ztag_changes(pending_text) if not pending_code else []
     if default_files: outgoing.insert(0, {"change": "default", "desc": "Default changelist (not yet numbered)"})
     errors = []
     if incoming_code: errors.append("Incoming query: " + (incoming_error or "failed"))
     if pending_code: errors.append("Outgoing query: " + (pending_error or "failed"))
-    return {"build": BUILD, "workspace": client, "incoming": format_changes(ztag_changes(incoming_text) if not incoming_code else []), "outgoing": format_changes(outgoing, default_files), "errors": errors, "checkedAt": datetime.now(timezone.utc).isoformat()}
+    incoming_rows = ztag_changes(incoming_text) if not incoming_code else []
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        incoming_future = executor.submit(format_changes, incoming_rows, None, 200)
+        outgoing_future = executor.submit(format_changes, outgoing, default_files)
+        incoming = incoming_future.result()
+        formatted_outgoing = outgoing_future.result()
+    return {"build": BUILD, "workspace": client, "incoming": incoming, "outgoing": formatted_outgoing, "errors": errors, "checkedAt": datetime.now(timezone.utc).isoformat()}
 
 def all_files():
     client, error = workspace()
@@ -224,7 +238,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
         except (ValueError, json.JSONDecodeError): self.json({"error": "Invalid connection settings."}, 400)
     def json(self, value, status=200):
-        body = json.dumps(value).encode(); self.send_response(status); self.send_header("Content-Type", "application/json"); self.send_header("Cache-Control", "no-store"); self.end_headers(); self.wfile.write(body)
+        body = json.dumps(value).encode()
+        try:
+            self.send_response(status); self.send_header("Content-Type", "application/json"); self.send_header("Cache-Control", "no-store"); self.end_headers(); self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
     def log_message(self, *_): pass
 
 if __name__ == "__main__":
