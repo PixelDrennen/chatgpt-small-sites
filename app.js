@@ -17,7 +17,7 @@ function buildTree(files) {
   });
   const render = (node, level = 0) => {
     const folders = Object.entries(node.folders).sort(([a], [b]) => a.localeCompare(b)).map(([name, child]) => `<details class="tree-folder" ${level < 1 ? 'open' : ''}><summary>📁 ${escapeHtml(name)}</summary>${render(child, level + 1)}</details>`).join('');
-    const files = node.files.sort((a,b) => a.name.localeCompare(b.name)).map(file => `<div class="tree-file"><span class="action ${actionClass(file.action)}">${escapeHtml(file.action)}</span><span title="${escapeHtml(file.path)}">${escapeHtml(file.name)}</span></div>`).join('');
+    const files = node.files.sort((a,b) => a.name.localeCompare(b.name)).map(file => { const action = file.action || 'edit'; return `<div class="tree-file"><span class="action ${actionClass(action)}">${escapeHtml(action)}</span><span title="${escapeHtml(file.path)}">${escapeHtml(file.name)}</span></div>`; }).join('');
     return `<div class="tree-children">${folders}${files}</div>`;
   };
   return render(root);
