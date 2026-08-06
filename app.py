@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parent
 PORT = int(os.environ.get("P4_DASHBOARD_PORT", "8765"))
-BUILD = "0.6.0"
+BUILD = "0.6.1"
 PID_FILE = ROOT / ".p4-monitor.pid"
 SETTINGS_FILE = ROOT / ".p4-monitor.json"
 SETTING_KEYS = ("P4PORT", "P4USER", "P4CLIENT")
@@ -59,11 +59,18 @@ def ztag_files(text):
     for line in text.splitlines():
         if not line.startswith("... "): continue
         key, _, value = line[4:].partition(" ")
-        if key in ("depotFile", "clientFile"):
+        if key == "depotFile":
             if current.get("path"):
                 records.append(current)
                 current = {}
             current["path"] = value
+            continue
+        # `opened -ztag` includes clientFile in the *same* record as depotFile.
+        # Keep the depot path (needed for the shared hierarchy) and use the
+        # client path only if Perforce did not send a depot path.
+        if key == "clientFile":
+            if not current.get("path"):
+                current["path"] = value
             continue
         if key == "action" and current.get("path"):
             current["action"] = value
