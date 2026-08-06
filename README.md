@@ -23,13 +23,18 @@ Use `P4_DASHBOARD_PORT=9000 python3 app.py` to choose another local port.
 ## What the two columns mean
 
 - **Incoming**: submitted depot changelists that are newer than the revisions
-  currently synced in the workspace (`//client/...@have,@now`).
+  currently synced in the workspace (`//stream/...@client,#head`).
 - **Outgoing**: pending numbered changelists assigned to the current client,
   plus files in the default changelist.
 
 The page refreshes every minute and has a manual Refresh button. Each
 changelist expands into a folder tree. Perforce adds are green, edits are
 yellow, and deletes are red.
+
+Build 0.7 adds a compact three-pane workspace: changelist previews on the
+left, depot and workspace files side by side, saved workspace switching,
+list/grid/tree views, name/type/date/action filters, and guarded merge, copy,
+and submit actions that show the exact `p4` command before running it.
 
 ## Notes
 
