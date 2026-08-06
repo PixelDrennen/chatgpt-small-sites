@@ -1,70 +1,42 @@
-const $ = (selector) => document.querySelector(selector);
-const escapeHtml = (value) => String(value).replace(/[&<>'"]/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
+const $ = selector => document.querySelector(selector);
+const $$ = selector => [...document.querySelectorAll(selector)];
+const state = { data:null, allFiles:null, scope:'changed', view:'list', changedView:'list', changeScope:'all', pendingAction:null };
+const esc = value => String(value ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+const actionKind = value => { const a=String(value||'edit').toLowerCase(); return a.includes('delete')?'delete':(a.includes('add')||a.includes('branch'))?'add':'modify'; };
+const basename = path => String(path||'').split('/').at(-1);
+const extension = path => { const name=basename(path); return name.includes('.')?name.split('.').at(-1).toLowerCase():'(no extension)'; };
+const changedFiles = (changes) => changes.flatMap(change => change.files.map(file => ({...file, change:change.id, description:change.description})));
+const uniqueFiles = files => [...new Map(files.map(file => [file.path,file])).values()];
 
-function actionClass(action = 'edit') {
-  const normalized = action.toLowerCase();
-  if (normalized.includes('delete') || normalized.includes('move/delete')) return 'delete';
-  if (normalized.includes('add') || normalized.includes('move/add') || normalized.includes('branch')) return 'add';
-  return 'modify';
+function settingsOptions(settings){ const list=$('#client-history'); list.innerHTML=''; (settings.clients||[]).forEach(value=>list.insertAdjacentHTML('beforeend',`<option value="${esc(value)}"></option>`)); for(const key of ['P4PORT','P4USER','P4CLIENT']){const input=$(`[name="${key}"]`);if(settings[key])input.value=settings[key];}}
+async function loadSettings(){const response=await fetch('/api/settings');settingsOptions(await response.json());}
+function showNotice(text,kind=''){const node=$('#notice');node.textContent=text;node.className=kind;}
+
+function renderChangelists(){
+  const incoming=state.data?.incoming||[], outgoing=state.data?.outgoing||[]; let list=state.changeScope==='incoming'?incoming:state.changeScope==='outgoing'?outgoing:[...outgoing,...incoming];
+  $('#change-total').textContent=`${list.length} changes`; const target=$('#change-list'); target.innerHTML='';
+  const select=$('#action-change'); select.innerHTML='<option value="">Select changelist…</option>';
+  outgoing.forEach(change=>{if(change.id!=='default')select.insertAdjacentHTML('beforeend',`<option value="${esc(change.id)}">CL ${esc(change.id)}</option>`)});
+  list.forEach(change=>{const direction=incoming.includes(change)?'incoming':'outgoing'; const preview=change.files.slice(0,40).map(file=>`<li><span class="status ${actionKind(file.action)}">${esc(file.action||'edit')}</span>${esc(file.path)}</li>`).join(''); target.insertAdjacentHTML('beforeend',`<article class="change-item ${direction}"><div class="change-head"><strong>${change.id==='default'?'Default':`CL ${esc(change.id)}`}</strong><span>${change.files.length.toLocaleString()} files</span></div><p>${esc(change.description||'No description')}</p><details><summary>Preview files</summary><ul>${preview}${change.files.length>40?`<li class="muted">…and ${(change.files.length-40).toLocaleString()} more</li>`:''}</ul></details></article>`)});
 }
 
-function buildTree(files) {
-  const root = { folders: {}, files: [] };
-  files.forEach(file => {
-    const parts = file.path.replace(/^\/\//, '').split('/'); let current = root;
-    parts.slice(0, -1).forEach(part => current = current.folders[part] ||= { folders: {}, files: [] });
-    current.files.push({ name: parts.at(-1), ...file });
-  });
-  const render = (node, level = 0) => {
-    const folders = Object.entries(node.folders).sort(([a], [b]) => a.localeCompare(b)).map(([name, child]) => `<details class="tree-folder" ${level < 1 ? 'open' : ''}><summary>📁 ${escapeHtml(name)}</summary>${render(child, level + 1)}</details>`).join('');
-    const files = node.files.sort((a,b) => a.name.localeCompare(b.name)).map(file => { const action = file.action || 'edit'; return `<div class="tree-file"><span class="action ${actionClass(action)}">${escapeHtml(action)}</span><span title="${escapeHtml(file.path)}">${escapeHtml(file.name)}</span></div>`; }).join('');
-    return `<div class="tree-children">${folders}${files}</div>`;
-  };
-  return render(root);
+function currentFileSets(){
+  if(state.scope==='all'&&state.allFiles){return {depot:state.allFiles,workspace:state.allFiles.filter(file=>file.clientPath)};}
+  return {depot:uniqueFiles(changedFiles(state.data?.incoming||[])),workspace:uniqueFiles(changedFiles(state.data?.outgoing||[]))};
 }
+function filtered(files){const q=$('#file-search').value.toLowerCase(), type=$('#type-filter').value, days=Number($('#date-filter').value||0), allowed=new Set($$('.action-filters input:checked').map(input=>input.value)), cutoff=days?Date.now()/1000-days*86400:0;return files.filter(file=>allowed.has(actionKind(file.action))&&(!q||String(file.path).toLowerCase().includes(q)||String(file.clientPath||'').toLowerCase().includes(q))&&(!type||extension(file.path)===type)&&(!cutoff||Number(file.workspaceModified||file.modified||0)>=cutoff));}
+function fileRow(file,workspace=false){const path=workspace&&file.clientPath?file.clientPath:file.path;return `<div class="file-card"><span class="status ${actionKind(file.action)}">${esc(file.action||'edit')}</span><div class="file-name"><strong>${esc(basename(path))}</strong><small title="${esc(path)}">${esc(path)}</small></div><span class="file-type">${esc(extension(path))}</span></div>`;}
+function buildTree(files,workspace){const root={};files.forEach(file=>{const path=workspace&&file.clientPath?file.clientPath:file.path;const parts=String(path).replace(/^\/\//,'').split('/');let node=root;parts.slice(0,-1).forEach(part=>node=node[part]??=( {$files:[]} ));(node.$files??=[]).push({...file,$name:parts.at(-1)});});const render=(node,level=0)=>Object.entries(node).filter(([key])=>key!=='$files').sort().map(([name,child])=>`<details ${level<1?'open':''}><summary>📁 ${esc(name)}</summary><div>${render(child,level+1)}</div></details>`).join('')+(node.$files||[]).map(file=>`<div class="tree-file"><span class="status ${actionKind(file.action)}">${esc(file.action||'edit')}</span>${esc(file.$name)}</div>`).join('');return `<div class="tree-root">${render(root)}</div>`;}
+function renderFiles(){const sets=currentFileSets();const depot=filtered(sets.depot),workspace=filtered(sets.workspace);const types=[...new Set([...sets.depot,...sets.workspace].map(file=>extension(file.path)))].sort();const select=$('#type-filter'),chosen=select.value;select.innerHTML='<option value="">All types</option>'+types.map(type=>`<option value="${esc(type)}">.${esc(type)}</option>`).join('');select.value=chosen;const render=(target,files,isWorkspace)=>{target.className=`file-view ${state.view}-view`;target.innerHTML=state.view==='tree'?buildTree(files,isWorkspace):files.slice(0,1200).map(file=>fileRow(file,isWorkspace)).join('')+(files.length>1200?`<p class="limit-note">Showing 1,200 of ${files.length.toLocaleString()} files. Narrow the filters to see the rest.</p>`:'');};render($('#depot-files'),depot,false);render($('#workspace-files'),workspace,true);$('#depot-summary').textContent=`${depot.length.toLocaleString()} of ${sets.depot.length.toLocaleString()} files`;$('#workspace-summary').textContent=`${workspace.length.toLocaleString()} of ${sets.workspace.length.toLocaleString()} files`;}
 
-function displayChanges(target, list, type) {
-  target.innerHTML = '';
-  if (!list.length) { target.innerHTML = `<p class="empty">No ${type} changes found.</p>`; return; }
-  const template = $('#change');
-  list.forEach(change => {
-    const node = template.content.cloneNode(true); const fileCount = change.files.length;
-    node.querySelector('.change-id').textContent = change.id === 'default' ? 'Default changelist' : `CL ${change.id}`;
-    node.querySelector('.change-meta').textContent = change.user ? `${change.user}${change.client ? ` · ${change.client}` : ''}` : '';
-    node.querySelector('.description').textContent = change.description || 'No description';
-    node.querySelector('summary').textContent = `${fileCount.toLocaleString()} file${fileCount === 1 ? '' : 's'} · view by folder`;
-    node.querySelector('.file-tree').innerHTML = buildTree(change.files);
-    target.append(node);
-  });
-}
+async function refresh(){showNotice('Checking Perforce…');$('#refresh').disabled=true;try{const response=await fetch('/api/changes',{cache:'no-store'});const data=await response.json();if(data.error)throw new Error(data.error);state.data=data;$('#build-label').textContent=`Build ${data.build}`;$('#workspace-stream').textContent=`${data.workspace.name} · ${data.workspace.stream||data.workspace.root}`;renderChangelists();renderFiles();showNotice(data.errors?.join(' | ')||`Updated ${new Date(data.checkedAt).toLocaleTimeString()}`,data.errors?.length?'warning':'success');}catch(error){showNotice(error.message,'error')}finally{$('#refresh').disabled=false;}}
+async function loadAll(){showNotice('Loading full depot and workspace index…');const response=await fetch('/api/files',{cache:'no-store'});const data=await response.json();if(data.error){showNotice(data.error,'error');return false;}state.allFiles=data.files||[];showNotice(`${state.allFiles.length.toLocaleString()} files indexed`,'success');return true;}
+async function beginAction(action){const change=$('#action-change').value;const response=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,change})});const data=await response.json();if(data.error)return showNotice(data.error,'error');state.pendingAction={action,change};$('#dialog-title').textContent=action==='submit'?'Submit changelist':action==='copy-up'?'Copy up to parent':'Merge down from parent';$('#dialog-copy').textContent='This changes Perforce state. Review the exact command before continuing.';$('#dialog-command').textContent=data.preview;$('#action-dialog').showModal();}
+async function runAction(){const payload={...state.pendingAction,confirmed:true};showNotice('Running Perforce action…');const response=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await response.json();showNotice(data.ok?`${data.command} completed`:data.error||'Action failed',data.ok?'success':'error');if(data.ok)refresh();}
 
-function notice(message, kind = 'secondary') {
-  $('#notice').innerHTML = message ? `<div class="alert alert-${kind} py-2 px-3 small mb-0">${escapeHtml(message)}</div>` : '';
-}
-
-async function getSettings() {
-  const response = await fetch('/api/settings'); const settings = await response.json();
-  Object.entries(settings).forEach(([key, value]) => { const input = $(`[name="${key}"]`); if (input) input.value = value; });
-}
-
-async function refresh() {
-  $('#refresh').disabled = true; notice('Checking Perforce…');
-  try {
-    const response = await fetch('/api/changes', {cache: 'no-store'}); const data = await response.json();
-    if (data.error) { $('#connection-card').hidden = false; throw new Error(data.error); }
-    $('#build-label').textContent = `Local dashboard · build ${data.build || 'unknown'}`;
-    $('#connection-card').hidden = false; // keep settings available, but compact once connected
-    $('#workspace').textContent = `${data.workspace.name} · ${data.workspace.stream || data.workspace.root || 'workspace connected'}`;
-    $('#incoming-count').textContent = data.incoming.length; $('#outgoing-count').textContent = data.outgoing.length;
-    displayChanges($('#incoming-list'), data.incoming, 'incoming'); displayChanges($('#outgoing-list'), data.outgoing, 'outgoing');
-    notice(data.errors.length ? data.errors.join(' | ') : `Connected · updated ${new Date(data.checkedAt).toLocaleTimeString()}`, data.errors.length ? 'warning' : 'success');
-  } catch (error) { notice(error.message, 'danger'); }
-  finally { $('#refresh').disabled = false; }
-}
-
-$('#connection-form').addEventListener('submit', async event => {
-  event.preventDefault(); const values = Object.fromEntries(new FormData(event.currentTarget));
-  const response = await fetch('/api/settings', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(values)});
-  const data = await response.json(); if (data.error) return notice(data.error, 'danger'); refresh();
-});
-$('#refresh').addEventListener('click', refresh); getSettings().then(refresh); setInterval(refresh, 60000);
+$('#connection-form').addEventListener('submit',async event=>{event.preventDefault();const values=Object.fromEntries(new FormData(event.currentTarget));const response=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(values)});settingsOptions((await response.json()).settings);refresh();});
+$('#remove-client').addEventListener('click',async()=>{const client=$('#client-input').value;if(!client||!confirm(`Remove saved workspace ${client}?`))return;const response=await fetch('/api/settings/remove-client',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client})});settingsOptions((await response.json()).settings);});
+$$('[data-change-scope]').forEach(button=>button.addEventListener('click',()=>{$$('[data-change-scope]').forEach(b=>b.classList.remove('active'));button.classList.add('active');state.changeScope=button.dataset.changeScope;renderChangelists();}));
+$$('[data-scope]').forEach(button=>button.addEventListener('click',async()=>{if(button.dataset.scope==='all'&&!state.allFiles&&!(await loadAll()))return;$$('[data-scope]').forEach(b=>b.classList.remove('active'));button.classList.add('active');state.scope=button.dataset.scope;state.view=state.scope==='all'?'tree':state.changedView;$$('[data-view]').forEach(b=>{b.disabled=state.scope==='all';b.classList.toggle('active',b.dataset.view===state.view)});renderFiles();}));
+$$('[data-view]').forEach(button=>button.addEventListener('click',()=>{if(state.scope==='all')return;$$('[data-view]').forEach(b=>b.classList.remove('active'));button.classList.add('active');state.view=button.dataset.view;state.changedView=state.view;renderFiles();}));
+['#file-search','#type-filter','#date-filter'].forEach(selector=>$(selector).addEventListener('input',renderFiles));$$('.action-filters input').forEach(input=>input.addEventListener('change',renderFiles));$$('[data-action]').forEach(button=>button.addEventListener('click',()=>beginAction(button.dataset.action)));$('#confirm-action').addEventListener('click',runAction);$('#refresh').addEventListener('click',refresh);loadSettings().then(refresh);setInterval(refresh,60000);
