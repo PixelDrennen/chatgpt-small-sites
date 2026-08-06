@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parent
 PORT = int(os.environ.get("P4_DASHBOARD_PORT", "8765"))
-BUILD = "0.7.0"
+BUILD = "0.7.1"
 PID_FILE = ROOT / ".p4-monitor.pid"
 SETTINGS_FILE = ROOT / ".p4-monitor.json"
 SETTING_KEYS = ("P4PORT", "P4USER", "P4CLIENT")
@@ -47,7 +47,11 @@ def remove_client(name):
 def p4(*args, timeout=12):
     if not shutil.which("p4"):
         return 127, "", "The 'p4' command is not installed or not in PATH."
-    env = os.environ.copy(); env.update(load_settings())
+    env = os.environ.copy()
+    settings = load_settings()
+    # Saved workspace history is application data, not an environment value.
+    # subprocess requires every environment value to be a string.
+    env.update({key: settings[key] for key in SETTING_KEYS if settings.get(key)})
     try:
         run = subprocess.run(["p4", *args], capture_output=True, text=True, timeout=timeout, env=env)
         return run.returncode, run.stdout, run.stderr.strip()
