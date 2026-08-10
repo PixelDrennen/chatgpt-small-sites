@@ -1,0 +1,3 @@
+[submodule "addressables-build-dashboard"]
+	path = addressables-build-dashboard
+	url = https://github.com/PixelDrennen/addressables-build-dashboard.git
